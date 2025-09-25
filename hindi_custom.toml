@@ -1,0 +1,25 @@
+# Custom Hindi F5-TTS Model Configuration
+model = "F5TTS_Hindi_Custom"
+ckpt_file = "/media/rdp/New Volume/F5-TTS/ckpts/F5TTS_Hindi_Custom_vocos_custom_IndicTTS_Hindi_CSV_char/model_last.pt"
+vocab_file = "/media/rdp/New Volume/F5-TTS/data/IndicTTS_Hindi_CSV_char/vocab.txt"
+
+# Reference audio and text
+ref_audio = "/media/rdp/New Volume/F5-TTS/modiji.wav"
+ref_text = "मांसुन के इस मौसम में प्राकृतिक आपदाएं देश की कसोटी कर रही हैं| पिछले कुछ हफ्तों में हमने बाड और भुस्खरन का बड़ा कहर देखा है|"
+
+# Text to generate
+gen_text = "आज का दिन बहुत सुंदर है और मौसम भी अच्छा है| हमें अपने देश की प्रगति के लिए मिलकर काम करना चाहिए|"
+
+# Output settings
+output_dir = "tests"
+remove_silence = false
+save_chunk = false
+
+# Model parameters
+target_rms = 0.1
+cross_fade_duration = 0.15
+nfe_step = 32
+cfg_strength = 2.0
+sway_sampling_coef = -1.0
+speed = 1.0
+fix_duration = null 

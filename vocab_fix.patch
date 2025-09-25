@@ -1,0 +1,29 @@
+--- a/src/f5_tts/train/datasets/prepare_csv_wavs.py
++++ b/src/f5_tts/train/datasets/prepare_csv_wavs.py
+@@ -327,13 +327,20 @@ def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_fine
+         # Remove any unwanted characters (optional filtering)
+         final_vocab_set = {char for char in final_vocab_set if char.isprintable() or char in ' \t\n\u200c\u200d\u200e\u2009'}
+         
+-        with open(voca_out_path.as_posix(), "w", encoding="utf-8") as f:
+-            for vocab in sorted(final_vocab_set):
+-                f.write(vocab + "\n")
++        # CRITICAL FIX: Remove empty strings and ensure space is at index 0
++        final_vocab_set = {char for char in final_vocab_set if char != ''}  # Remove empty strings
++        
++        # Convert to sorted list for proper ordering
++        vocab_list = sorted(final_vocab_set)
++        
++        # Ensure space character is at index 0 (required by tokenizer)
++        if ' ' in vocab_list:
++            vocab_list.remove(' ')  # Remove space from its current position
++            vocab_list.insert(0, ' ')  # Insert space at index 0
++        
++        # Write the properly ordered vocabulary
++        with open(voca_out_path.as_posix(), "w", encoding="utf-8") as f:
++            for vocab in vocab_list:
++                f.write(vocab + "\n")
+         
+         print(f"Created comprehensive vocabulary with {len(final_vocab_set)} characters for {language}")
++        print(f"Space character is at index 0: {'✓' if vocab_list[0] == ' ' else '✗'}")
+         print(f"Dataset contributed {len(text_vocab_set)} unique characters")
+         print(f"Base language set contributed {len(comprehensive_vocab)} characters")

@@ -1,0 +1,57 @@
+hydra:
+  run:
+    dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datasets:
+  name: Combined_hinglish_CSV_char
+  batch_size_per_gpu: 76800  # frame-based batching (roughly 1.6s of audio)
+  batch_size_type: frame  # frame batching for TTS
+  max_samples: 512  # max samples per batch
+  num_workers: 16  # increase for training from scratch
+  shuffle_dataset: True
+  pin_memory: True
+
+optim:
+  epochs: 8000  # much higher for training from scratch
+  learning_rate: 1e-5  # higher learning rate for scratch training
+  num_warmup_updates: 2000  # longer warmup for scratch training
+  grad_accumulation_steps: 1  # accumulate gradients for larger effective batch size
+  max_grad_norm: 1.0
+  bnb_optimizer: True  # use 8-bit optimizer to save memory
+
+model:
+  name: F5TTS_Hinglish_Scratch  # indicate this is from scratch
+  tokenizer: custom
+  tokenizer_path: /media/rdp/New Volume/F5-TTS/data/Combined_hinglish_CSV_char/vocab.txt
+  backbone: DiT
+  arch:
+    dim: 768
+    depth: 18
+    heads: 12
+    ff_mult: 2
+    text_dim: 512
+    text_mask_padding: True
+    qk_norm: null
+    conv_layers: 4
+    pe_attn_head: null
+    attn_backend: torch
+    attn_mask_enabled: False
+    checkpoint_activations: True  # save memory during training from scratch
+  mel_spec:
+    target_sample_rate: 24000
+    n_mel_channels: 100
+    hop_length: 256
+    win_length: 1024
+    n_fft: 1024
+    mel_spec_type: vocos
+  vocoder:
+    is_local: False
+    local_path: null
+
+ckpts:
+  logger: wandb
+  log_samples: True
+  save_per_updates: 300  # save more frequently for scratch training
+  keep_last_n_checkpoints: 5  # keep fewer to save disk space
+  last_per_updates: 300  # frequent last saves
+  save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
