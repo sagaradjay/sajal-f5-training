@@ -3,50 +3,172 @@ import multiprocessing
 import os
 import shutil
 import signal
-import subprocess  # For invoking ffprobe
+import subprocess
 import sys
 from contextlib import contextmanager
-
+import re
+import unicodedata
 
 sys.path.append(os.getcwd())
 
 import argparse
 import csv
 import json
-from importlib.resources import files
 from pathlib import Path
-
+import librosa
+import soundfile as sf
 import torchaudio
 from datasets.arrow_writer import ArrowWriter
 from tqdm import tqdm
 
-from f5_tts.model.utils import convert_char_to_pinyin
-
-
-PRETRAINED_VOCAB_PATH = files("f5_tts").joinpath("../../data/Emilia_ZH_EN_pinyin/vocab.txt")
-
-
-def is_csv_wavs_format(input_dataset_dir):
-    fpath = Path(input_dataset_dir)
-    metadata = fpath / "metadata.csv"
-    wavs = fpath / "wavs"
-    return metadata.exists() and metadata.is_file() and wavs.exists() and wavs.is_dir()
-
-
 # Configuration constants
-BATCH_SIZE = 100  # Batch size for text conversion
-MAX_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Leave one CPU free
+BATCH_SIZE = 100
+MAX_WORKERS = max(1, multiprocessing.cpu_count() - 1)
 THREAD_NAME_PREFIX = "AudioProcessor"
-CHUNK_SIZE = 100  # Number of files to process per worker batch
-TARGET_SAMPLE_RATE = 24000  # Target sample rate for preprocessing
+CHUNK_SIZE = 50  # Reduced for audio processing
+TARGET_SAMPLE_RATE = 24000
+TARGET_CHANNELS = 1  # Mono
 
-executor = None  # Global executor for cleanup
+executor = None
+
+
+def normalize_hindi_english_text(text):
+    """
+    Normalize Hindi and English text by:
+    1. Converting to lowercase (for English parts)
+    2. Removing extra whitespace
+    3. Normalizing Unicode characters
+    4. Removing special characters but keeping basic punctuation
+    """
+    # Normalize Unicode
+    text = unicodedata.normalize('NFKC', text)
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Keep alphanumeric characters, spaces, and basic punctuation for both Hindi and English
+    # This regex keeps:
+    # - Latin characters (English): a-zA-Z
+    # - Devanagari characters (Hindi): \u0900-\u097F
+    # - Numbers: 0-9
+    # - Basic punctuation: .,!?;:-'"()[]
+    # - Spaces
+    text = re.sub(r'[^\w\s\u0900-\u097F.,!?;:\-\'"()\[\]]+', ' ', text)
+    
+    # Convert English parts to lowercase while preserving Hindi
+    # This is a simple approach - you might want more sophisticated language detection
+    result = ""
+    for char in text:
+        if char.isalpha() and ord(char) < 256:  # Basic Latin characters
+            result += char.lower()
+        else:
+            result += char
+    
+    # Clean up extra spaces again
+    result = re.sub(r'\s+', ' ', result).strip()
+    
+    return result
+
+
+def create_vocab_from_text(texts):
+    """Create vocabulary set from Hindi-English texts"""
+    vocab_set = set()
+    for text in texts:
+        # Add all unique characters to vocabulary
+        vocab_set.update(list(text))
+    return vocab_set
+
+
+def batch_normalize_texts(texts, batch_size=BATCH_SIZE):
+    """Normalize a list of texts in batches."""
+    normalized_texts = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        normalized_batch = [normalize_hindi_english_text(text) for text in batch]
+        normalized_texts.extend(normalized_batch)
+    return normalized_texts
+
+
+def convert_audio_format(input_path, output_path, target_sr=TARGET_SAMPLE_RATE, target_channels=TARGET_CHANNELS):
+    """
+    Convert audio to target sample rate and channel configuration using librosa and soundfile
+    """
+    try:
+        # Load audio file
+        audio, sr = librosa.load(input_path, sr=None, mono=False)
+        
+        # Convert to mono if needed
+        if audio.ndim > 1 and target_channels == 1:
+            audio = librosa.to_mono(audio)
+        elif audio.ndim == 1 and target_channels > 1:
+            # If input is mono but we want stereo (unlikely for TTS)
+            audio = audio.reshape(1, -1)
+        
+        # Resample if needed
+        if sr != target_sr:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+        
+        # Ensure audio is in the right shape
+        if target_channels == 1 and audio.ndim > 1:
+            audio = audio.flatten()
+        
+        # Save the converted audio
+        sf.write(output_path, audio, target_sr)
+        return True
+        
+    except Exception as e:
+        print(f"Error converting {input_path}: {e}")
+        return False
+
+
+def process_audio_file(audio_path, text, output_dir):
+    """Process a single audio file: check existence, convert format, and extract duration."""
+    input_path = Path(audio_path)
+    if not input_path.exists():
+        print(f"Audio {audio_path} not found, skipping")
+        return None
+    
+    try:
+        # Create output path with same filename but in processed directory
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / input_path.name
+        
+        # Check if file needs conversion
+        needs_conversion = False
+        try:
+            # Check current audio properties
+            info = torchaudio.info(str(input_path))
+            if info.sample_rate != TARGET_SAMPLE_RATE or info.num_channels != TARGET_CHANNELS:
+                needs_conversion = True
+        except Exception:
+            needs_conversion = True
+        
+        if needs_conversion:
+            # Convert audio format
+            if not convert_audio_format(str(input_path), str(output_path)):
+                return None
+            final_audio_path = str(output_path)
+        else:
+            # Copy file if already in correct format
+            shutil.copy2(str(input_path), str(output_path))
+            final_audio_path = str(output_path)
+        
+        # Get duration of processed audio
+        audio_duration = get_audio_duration(final_audio_path)
+        if audio_duration <= 0:
+            raise ValueError(f"Duration {audio_duration} is non-positive.")
+            
+        return (final_audio_path, text, audio_duration)
+        
+    except Exception as e:
+        print(f"Warning: Failed to process {audio_path} due to error: {e}. Skipping corrupt file.")
+        return None
 
 
 @contextmanager
 def graceful_exit():
     """Context manager for graceful shutdown on signals"""
-
     def signal_handler(signum, frame):
         print("\nReceived signal to terminate. Cleaning up...")
         if executor is not None:
@@ -54,7 +176,6 @@ def graceful_exit():
             executor.shutdown(wait=False, cancel_futures=True)
         sys.exit(1)
 
-    # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -65,325 +186,108 @@ def graceful_exit():
             executor.shutdown(wait=False)
 
 
-def preprocess_single_audio(args):
-    """Preprocess a single audio file to mono 24kHz"""
-    input_path, output_path = args
-    
-    try:
-        # Load the audio file
-        waveform, sample_rate = torchaudio.load(input_path)
-        
-        # Check original properties
-        original_channels = waveform.shape[0]
-        original_sample_rate = sample_rate
-        needs_conversion = False
-        
-        # Convert to mono if needed
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-            needs_conversion = True
-            
-        # Resample if needed
-        if sample_rate != TARGET_SAMPLE_RATE:
-            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE)
-            waveform = resampler(waveform)
-            needs_conversion = True
-            
-        # Save the processed audio
-        torchaudio.save(output_path, waveform, TARGET_SAMPLE_RATE)
-        
-        return {
-            'input_path': str(input_path),
-            'output_path': str(output_path),
-            'original_channels': original_channels,
-            'original_sample_rate': original_sample_rate,
-            'final_channels': 1,
-            'final_sample_rate': TARGET_SAMPLE_RATE,
-            'needed_conversion': needs_conversion,
-            'success': True,
-            'error': None
-        }
-        
-    except Exception as e:
-        return {
-            'input_path': str(input_path),
-            'output_path': str(output_path),
-            'original_channels': None,
-            'original_sample_rate': None,
-            'final_channels': None,
-            'final_sample_rate': None,
-            'needed_conversion': None,
-            'success': False,
-            'error': str(e)
-        }
+def is_csv_wavs_format(input_dataset_dir):
+    fpath = Path(input_dataset_dir)
+    metadata = fpath / "metadata.csv"
+    wavs = fpath / "wavs"
+    return metadata.exists() and metadata.is_file() and wavs.exists() and wavs.is_dir()
 
 
-def preprocess_audio_directory(input_dir, num_workers=None):
-    """Preprocess all audio files in the wavs directory to mono 24kHz"""
-    input_dir = Path(input_dir)
-    wavs_dir = input_dir / "wavs"
-    wavs_24khz_dir = input_dir / "wavs_24khz"
-    
-    if not wavs_dir.exists():
-        raise ValueError(f"wavs directory not found: {wavs_dir}")
-    
-    # Create output directory
-    wavs_24khz_dir.mkdir(exist_ok=True)
-    
-    # Find all audio files
-    audio_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}
-    audio_files = []
-    for ext in audio_extensions:
-        audio_files.extend(wavs_dir.glob(f"*{ext}"))
-    
-    if not audio_files:
-        raise ValueError(f"No audio files found in {wavs_dir}")
-    
-    print(f"Found {len(audio_files)} audio files to preprocess")
-    print(f"Converting to mono {TARGET_SAMPLE_RATE}Hz and saving to {wavs_24khz_dir}")
-    
-    # Prepare arguments for multiprocessing
-    args_list = []
-    for audio_file in audio_files:
-        output_file = wavs_24khz_dir / f"{audio_file.stem}.wav"  # Always save as .wav
-        args_list.append((audio_file, output_file))
-    
-    # Use provided worker count or calculate optimal number
-    worker_count = num_workers if num_workers is not None else min(MAX_WORKERS, len(audio_files))
-    
-    # Process files with multiprocessing
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        # Process in chunks to show progress
-        for i in range(0, len(args_list), CHUNK_SIZE):
-            chunk = args_list[i:i + CHUNK_SIZE]
-            chunk_futures = [executor.submit(preprocess_single_audio, args) for args in chunk]
-            
-            for future in tqdm(
-                chunk_futures,
-                desc=f"Processing chunk {i // CHUNK_SIZE + 1}/{(len(args_list) + CHUNK_SIZE - 1) // CHUNK_SIZE}",
-                total=len(chunk)
-            ):
-                result = future.result()
-                results.append(result)
-    
-    # Analyze results
-    successful = [r for r in results if r['success']]
-    failed = [r for r in results if not r['success']]
-    needed_conversion = [r for r in successful if r['needed_conversion']]
-    already_correct = [r for r in successful if not r['needed_conversion']]
-    
-    # Print statistics
-    print(f"\n=== Audio Preprocessing Statistics ===")
-    print(f"Total files processed: {len(results)}")
-    print(f"Successfully converted: {len(successful)}")
-    print(f"Failed conversions: {len(failed)}")
-    print(f"Files that needed conversion: {len(needed_conversion)}")
-    print(f"Files already in correct format: {len(already_correct)}")
-    
-    if needed_conversion:
-        print(f"\nConversion details:")
-        sample_rates = {}
-        channels = {}
-        for r in needed_conversion:
-            sr = r['original_sample_rate']
-            ch = r['original_channels']
-            sample_rates[sr] = sample_rates.get(sr, 0) + 1
-            channels[ch] = channels.get(ch, 0) + 1
-        
-        print(f"Original sample rates: {dict(sample_rates)}")
-        print(f"Original channel counts: {dict(channels)}")
-    
-    if failed:
-        print(f"\nFailed files:")
-        for r in failed[:10]:  # Show first 10 failed files
-            print(f"  {r['input_path']}: {r['error']}")
-        if len(failed) > 10:
-            print(f"  ... and {len(failed) - 10} more")
-    
-    # Update metadata.csv to point to new wavs_24khz directory
-    metadata_path = input_dir / "metadata.csv"
-    if metadata_path.exists():
-        new_metadata_path = input_dir / "metadata_24khz.csv"
-        print(f"\nUpdating metadata file: {new_metadata_path}")
-        
-        with open(metadata_path, 'r', encoding='utf-8-sig') as infile, \
-             open(new_metadata_path, 'w', encoding='utf-8', newline='') as outfile:
-            
-            reader = csv.reader(infile, delimiter='|')
-            writer = csv.writer(outfile, delimiter='|')
-            
-            # Copy header
-            header = next(reader)
-            writer.writerow(header)
-            
-            # Update paths in data rows
-            for row in reader:
-                if len(row) >= 2:
-                    original_audio_path = row[0].strip()
-                    # Extract filename and change extension to .wav, point to wavs_24khz
-                    filename = Path(original_audio_path).stem + '.wav'
-                    new_audio_path = f"wavs_24khz/{filename}"
-                    
-                    new_row = [new_audio_path] + row[1:]
-                    writer.writerow(new_row)
-        
-        print(f"Updated metadata saved as: {new_metadata_path}")
-        return new_metadata_path
-    else:
-        print("Warning: metadata.csv not found, cannot update paths")
-        return None
-    
-    return results
-
-
-def process_audio_file(audio_path, text, language):
-    """Process a single audio file by checking its existence and extracting duration."""
-    if not Path(audio_path).exists():
-        print(f"audio {audio_path} not found, skipping")
-        return None
-    try:
-        audio_duration = get_audio_duration(audio_path)
-        if audio_duration <= 0:
-            raise ValueError(f"Duration {audio_duration} is non-positive.")
-        return (audio_path, text, audio_duration)
-    except Exception as e:
-        print(f"Warning: Failed to process {audio_path} due to error: {e}. Skipping corrupt file.")
-        return None
-
-
-def normalize_hindi_text(text):
-    """Normalize Hindi text for better consistency"""
-    # Remove extra whitespace
-    text = ' '.join(text.split())
-    
-    # Basic punctuation normalization
-    text = text.replace('।', '.')  # Replace devanagari danda with period
-    text = text.replace('॥', '..')  # Replace double danda
-    
-    # Remove or normalize other problematic characters if needed
-    # Add more normalization rules as you discover issues
-    
-    return text
-
-
-def batch_convert_texts(texts, language, polyphone=True, batch_size=BATCH_SIZE):
-    """Convert texts based on language - pinyin for Chinese, keep original for others."""
-    if language.lower() == "chinese":
-        converted_texts = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            converted_batch = convert_char_to_pinyin(batch, polyphone=polyphone)
-            converted_texts.extend(converted_batch)
-        return converted_texts
-    elif language.lower() in ["hindi", "hindi1"]:
-        # For Hindi, normalize but don't convert to pinyin
-        return [normalize_hindi_text(text) for text in texts]
-    else:
-        # For other languages, return as-is
-        return texts
-
-
-def prepare_csv_wavs_dir(input_dir, language="chinese", num_workers=None, use_preprocessed=False):
+def prepare_csv_wavs_dir(input_dir, output_dir, num_workers=None):
     global executor
     assert is_csv_wavs_format(input_dir), f"not csv_wavs format: {input_dir}"
-    input_dir = Path(input_dir)
     
-    # Choose which metadata file to use
-    if use_preprocessed:
-        metadata_path = input_dir / "metadata_24khz.csv"
-        if not metadata_path.exists():
-            raise ValueError("Preprocessed metadata file not found. Run preprocessing first.")
-    else:
-        metadata_path = input_dir / "metadata.csv"
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    metadata_path = input_dir / "metadata.csv"
+    
+    # Create processed audio directory
+    processed_audio_dir = output_dir / "processed_wavs"
+    processed_audio_dir.mkdir(parents=True, exist_ok=True)
     
     audio_path_text_pairs = read_audio_text_pairs(metadata_path.as_posix())
-
-    polyphone = True
     total_files = len(audio_path_text_pairs)
 
-    # Use provided worker count or calculate optimal number
     worker_count = num_workers if num_workers is not None else min(MAX_WORKERS, total_files)
     print(f"\nProcessing {total_files} audio files using {worker_count} workers...")
-    print(f"Language: {language}")
-    print(f"Using preprocessed audio: {use_preprocessed}")
+    print(f"Converting audio to {TARGET_SAMPLE_RATE}Hz, {TARGET_CHANNELS} channel(s)...")
 
     with graceful_exit():
-        # Initialize thread pool with optimized settings
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=worker_count, thread_name_prefix=THREAD_NAME_PREFIX
         ) as exec:
             executor = exec
             results = []
 
-            # Process files in chunks for better efficiency
-            for i in range(0, len(audio_path_text_pairs), CHUNK_SIZE):
-                chunk = audio_path_text_pairs[i : i + CHUNK_SIZE]
-                # Submit futures in order
-                chunk_futures = [executor.submit(process_audio_file, pair[0], pair[1], language) for pair in chunk]
+            # Create a single progress bar for the entire process
+            total_chunks = (total_files + CHUNK_SIZE - 1) // CHUNK_SIZE
+            
+            with tqdm(total=total_files, desc="Processing audio files", unit="files") as pbar:
+                for i in range(0, len(audio_path_text_pairs), CHUNK_SIZE):
+                    chunk = audio_path_text_pairs[i : i + CHUNK_SIZE]
+                    chunk_futures = [
+                        executor.submit(process_audio_file, pair[0], pair[1], processed_audio_dir) 
+                        for pair in chunk
+                    ]
 
-                # Iterate over futures in the original submission order to preserve ordering
-                for future in tqdm(
-                    chunk_futures,
-                    total=len(chunk),
-                    desc=f"Processing chunk {i // CHUNK_SIZE + 1}/{(total_files + CHUNK_SIZE - 1) // CHUNK_SIZE}",
-                ):
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            results.append(result)
-                    except Exception as e:
-                        print(f"Error processing file: {e}")
+                    # Process futures without nested progress bars
+                    for future in chunk_futures:
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                results.append(result)
+                            pbar.update(1)  # Update progress for each file
+                        except Exception as e:
+                            print(f"Error processing file: {e}")
+                            pbar.update(1)  # Still update progress even on error
+                    
+                    # Optional: Print summary every 100 chunks (5000 files)
+                    current_chunk = i // CHUNK_SIZE + 1
+                    if current_chunk % 100 == 0:
+                        processed_count = len(results)
+                        print(f"\nProgress: {current_chunk}/{total_chunks} chunks | {processed_count} files successfully processed")
 
             executor = None
 
-    # Filter out failed results
     processed = [res for res in results if res is not None]
     if not processed:
         raise RuntimeError("No valid audio files were processed!")
 
-    # Batch process text conversion based on language
+    # Batch process text normalization
     raw_texts = [item[1] for item in processed]
-    converted_texts = batch_convert_texts(raw_texts, language, polyphone, batch_size=BATCH_SIZE)
+    normalized_texts = batch_normalize_texts(raw_texts, batch_size=BATCH_SIZE)
 
-    # Prepare final results and build vocabulary
+    # Create vocabulary from normalized texts
+    vocab_set = create_vocab_from_text(normalized_texts)
+
+    # Prepare final results
     sub_result = []
     durations = []
-    vocab_set = set()
 
-    for (audio_path, _, duration), conv_text in zip(processed, converted_texts):
-        sub_result.append({"audio_path": audio_path, "text": conv_text, "duration": duration})
+    for (audio_path, _, duration), norm_text in zip(processed, normalized_texts):
+        sub_result.append({
+            "audio_path": audio_path, 
+            "text": norm_text, 
+            "duration": duration
+        })
         durations.append(duration)
-        
-        # Add characters to vocabulary set
-        # For Hindi, this will include Devanagari characters
-        # For Chinese with pinyin, this will include pinyin characters
-        vocab_set.update(list(conv_text))
-
-    print(f"\nVocabulary preview (first 20 characters): {sorted(list(vocab_set))[:20]}")
-    print(f"Total unique characters in dataset: {len(vocab_set)}")
 
     return sub_result, durations, vocab_set
 
 
-def get_audio_duration(audio_path, timeout=5):
-    """
-    Get the duration of an audio file in seconds using ffmpeg's ffprobe.
-    Falls back to torchaudio.load() if ffprobe fails.
-    """
+def get_audio_duration(audio_path, timeout=10):
+    """Get the duration of an audio file in seconds using ffmpeg's ffprobe."""
     try:
         cmd = [
             "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
             audio_path,
         ]
         result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=timeout
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+            text=True, check=True, timeout=timeout
         )
         duration_str = result.stdout.strip()
         if duration_str:
@@ -400,213 +304,127 @@ def get_audio_duration(audio_path, timeout=5):
 
 def read_audio_text_pairs(csv_file_path):
     audio_text_pairs = []
-
     parent = Path(csv_file_path).parent
+
     with open(csv_file_path, mode="r", newline="", encoding="utf-8-sig") as csvfile:
         reader = csv.reader(csvfile, delimiter="|")
         next(reader)  # Skip the header row
+        
+        # Debug: Print first few rows to understand the format
+        row_count = 0
         for row in reader:
             if len(row) >= 2:
-                audio_file = row[0].strip()  # First column: audio file path
-                text = row[1].strip()  # Second column: text
-                audio_file_path = parent / audio_file
+                audio_file = row[0].strip()
+                text = row[1].strip()
+                
+                # Debug output for first 3 files
+                if row_count < 3:
+                    print(f"Debug - Row {row_count}: audio_file='{audio_file}', text='{text[:50]}...'")
+                
+                # Check if audio_file already contains path info or is just filename
+                if "/" in audio_file or "\\" in audio_file:
+                    # If it contains path separators, use as-is relative to parent
+                    audio_file_path = parent / audio_file
+                else:
+                    # If it's just a filename, assume it's in the wavs folder
+                    audio_file_path = parent / "wavs" / audio_file
+                
+                # Debug output for first 3 files
+                if row_count < 3:
+                    print(f"Debug - Constructed path: {audio_file_path}")
+                    print(f"Debug - File exists: {audio_file_path.exists()}")
+                    
                 audio_text_pairs.append((audio_file_path.as_posix(), text))
+                row_count += 1
 
+    print(f"Debug - Total rows processed: {row_count}")
     return audio_text_pairs
 
 
-def get_comprehensive_vocab_set(language):
-    """Get a comprehensive character set for the specified language - FIXED to match actual dataset"""
-    base_vocab = set()
-    
-    # English letters
-    english_letters = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
-    
-    # English numbers
-    english_numbers = set('0123456789')
-    
-    # Common punctuation - CORRECTED to match your dataset analysis
-    punctuation = set('!"#$%&\'()*+,-./:;<=>?@\\^_{|}~""''–—…')
-    
-    # Space and common whitespace - CORRECTED
-    whitespace = set(' \t\n')  # Only basic whitespace
-    
-    # Additional special characters - CORRECTED to match your dataset
-    special_chars = set("°ºâñāīśū˜λμπφω€™•")
-    
-    # Always include these base characters
-    base_vocab.update(english_letters)
-    base_vocab.update(english_numbers)
-    base_vocab.update(punctuation)
-    base_vocab.update(whitespace)
-    base_vocab.update(special_chars)
-    
-    if language.lower() in ["hindi", "hindi1"]:  # Support both hindi and hindi1
-        # Hindi numbers (Devanagari numerals)
-        hindi_numbers = set('०१२३४५६७८९')
-        
-        # Hindi vowels - CORRECTED to match your dataset (removed ॠ, ऌ, ॡ that aren't in your data)
-        hindi_vowels = set('अआइईउऊऋऍऎएऐऑऒओऔ')
-        
-        # Hindi consonants - CORRECTED to match your dataset
-        hindi_consonants = set('कखगघङचछजझञटठडढणतथदधनऩपफबभमयरऱलळवशषसह')
-        
-        # Hindi vowel diacritics (matras) - FIXED: Remove Bengali chars, only Hindi matras
-        hindi_matras = set('ािीुूृॄॅॆेैॉॊोौ्')  # REMOVED Bengali chars ী, ু, ূ, ৃ, ৄ, ে, ৈ, ো, ৌ, ্
-        
-        # Hindi special characters - CORRECTED to match your dataset
-        hindi_special = set('ंःँ़्ॐ')  # Simplified to commonly used chars
-        
-        # Hindi extended characters (commonly used)
-        hindi_extended = set('क़ख़ग़ज़ड़ढ़फ़य़')
-        
-        # Hindi punctuation
-        hindi_punctuation = set('।॥')
-        
-        # Hindi additional Devanagari numbers and symbols - from your analysis
-        hindi_additional = set('॰ॲ')
-        
-        # Zero-width characters (used in Devanagari) - CORRECTED
-        hindi_zw = set('\u200c\u200d\u200e')  # Zero-width non-joiner, joiner, and LTR mark
-        
-        # Additional characters from comprehensive vocab (transliteration marks)
-        additional_devanagari = set('ḍṅṇṛṣṭ')
-        
-        base_vocab.update(hindi_numbers)
-        base_vocab.update(hindi_vowels)
-        base_vocab.update(hindi_consonants)
-        base_vocab.update(hindi_matras)
-        base_vocab.update(hindi_special)
-        base_vocab.update(hindi_extended)
-        base_vocab.update(hindi_punctuation)
-        base_vocab.update(hindi_additional)
-        base_vocab.update(hindi_zw)
-        base_vocab.update(additional_devanagari)
-    
-    return base_vocab
-
-
-def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_finetune, language):
+def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set):
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
-    print(f"\nSaving to {out_dir} ...")
+    print(f"\nSaving dataset to {out_dir} ...")
 
+    # Save main dataset
     raw_arrow_path = out_dir / "raw.arrow"
     with ArrowWriter(path=raw_arrow_path.as_posix()) as writer:
         for line in tqdm(result, desc="Writing to raw.arrow ..."):
             writer.write(line)
         writer.finalize()
 
-    # Save durations to JSON
+    # Save durations
     dur_json_path = out_dir / "duration.json"
     with open(dur_json_path.as_posix(), "w", encoding="utf-8") as f:
         json.dump({"duration": duration_list}, f, ensure_ascii=False)
 
-    # Handle vocab file based on language and finetune flag
-    voca_out_path = out_dir / "vocab.txt"
-    if is_finetune and language.lower() == "chinese":
-        # For Chinese fine-tuning, use pretrained vocab
-        file_vocab_finetune = PRETRAINED_VOCAB_PATH.as_posix()
-        shutil.copy2(file_vocab_finetune, voca_out_path)
-        print("Using pretrained Chinese vocab for fine-tuning")
-    else:
-        # For Hindi or training from scratch, create comprehensive vocab
-        comprehensive_vocab = get_comprehensive_vocab_set(language)
-        
-        # Merge with characters found in dataset
-        final_vocab_set = comprehensive_vocab.union(text_vocab_set)
-        
-        # Remove any unwanted characters (optional filtering)
-        final_vocab_set = {char for char in final_vocab_set if char.isprintable() or char in ' \t\n\u200c\u200d\u200e\u2009'}
-        
-        # CRITICAL FIX: Remove empty strings and ensure space is at index 0
-        final_vocab_set = {char for char in final_vocab_set if char != ''}  # Remove empty strings
-        
-        # Convert to sorted list for proper ordering
-        vocab_list = sorted(final_vocab_set)
-        
-        # Ensure space character is at index 0 (required by tokenizer)
-        if ' ' in vocab_list:
-            vocab_list.remove(' ')  # Remove space from its current position
-            vocab_list.insert(0, ' ')  # Insert space at index 0
-        
-        # Write the properly ordered vocabulary
-        with open(voca_out_path.as_posix(), "w", encoding="utf-8") as f:
-            for vocab in vocab_list:
-                f.write(vocab + "\n")
-        
-        print(f"Created comprehensive vocabulary with {len(vocab_list)} characters for {language}")
-        print(f"Space character is at index 0: {'✓' if vocab_list[0] == ' ' else '✗'}")
-        print(f"Dataset contributed {len(text_vocab_set)} unique characters")
-        print(f"Base language set contributed {len(comprehensive_vocab)} characters")
+    # Save vocabulary
+    vocab_path = out_dir / "vocab.txt"
+    with open(vocab_path.as_posix(), "w", encoding="utf-8") as f:
+        for vocab in sorted(text_vocab_set):
+            f.write(vocab + "\n")
 
     dataset_name = out_dir.stem
-    print(f"\nFor {dataset_name}, sample count: {len(result)}")
-    print(f"For {dataset_name}, total vocab size: {len(final_vocab_set) if 'final_vocab_set' in locals() else 'N/A'}")
-    print(f"For {dataset_name}, total {sum(duration_list) / 3600:.2f} hours")
+    print(f"\nDataset: {dataset_name}")
+    print(f"Sample count: {len(result)}")
+    print(f"Vocab size: {len(text_vocab_set)}")
+    print(f"Total duration: {sum(duration_list) / 3600:.2f} hours")
+    print(f"Audio format: {TARGET_SAMPLE_RATE}Hz, {TARGET_CHANNELS} channel(s)")
 
 
-def prepare_and_save_set(inp_dir, out_dir, language="chinese", is_finetune: bool = True, num_workers: int = None, preprocess_audio: bool = False):
-    if is_finetune and language.lower() == "chinese":
-        assert PRETRAINED_VOCAB_PATH.exists(), f"pretrained vocab.txt not found: {PRETRAINED_VOCAB_PATH}"
-    
-    # Preprocess audio if requested
-    if preprocess_audio:
-        print("=== Audio Preprocessing Phase ===")
-        preprocess_audio_directory(inp_dir, num_workers)
-        print("\n=== Dataset Processing Phase ===")
-        sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir, language=language, num_workers=num_workers, use_preprocessed=True)
-    else:
-        sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir, language=language, num_workers=num_workers, use_preprocessed=False)
-    
-    save_prepped_dataset(out_dir, sub_result, durations, vocab_set, is_finetune, language)
+def prepare_and_save_set(inp_dir, out_dir, num_workers=None):
+    sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir, out_dir, num_workers=num_workers)
+    save_prepped_dataset(out_dir, sub_result, durations, vocab_set)
 
 
 def cli():
     try:
-        # Import torch here to avoid issues if not available during argument parsing
-        import torch
+        # Check dependencies
+        missing_deps = []
+        try:
+            import librosa
+            import soundfile
+        except ImportError as e:
+            missing_deps.append(str(e))
         
-        # Before processing, check if ffprobe is available.
-        if shutil.which("ffprobe") is None:
-            print(
-                "Warning: ffprobe is not available. Duration extraction will rely on torchaudio (which may be slower)."
-            )
+        if missing_deps:
+            print("Missing dependencies. Please install:")
+            print("pip install librosa soundfile")
+            for dep in missing_deps:
+                print(f"  - {dep}")
+            sys.exit(1)
 
-        # Usage examples in help text
+        if shutil.which("ffprobe") is None:
+            print("Warning: ffprobe not available. Duration extraction will use torchaudio (slower).")
+
         parser = argparse.ArgumentParser(
-            description="Prepare and save dataset for different languages with optional audio preprocessing.",
+            description="Prepare Hindi-English TTS dataset with audio format standardization.",
             epilog="""
 Examples:
-    # For Hindi fine-tuning with audio preprocessing:
-    python prepare_csv_wavs.py /input/dataset/path /output/dataset/path --language hindi --preprocess-audio
-    
-    # For Hindi training from scratch with preprocessing:
-    python prepare_csv_wavs.py /input/dataset/path /output/dataset/path --language hindi --pretrain --preprocess-audio
-    
-    # For Chinese fine-tuning (default):
-    python prepare_csv_wavs.py /input/dataset/path /output/dataset/path --language chinese
+    # Basic usage:
+    python prepare_hindi_english.py /input/dataset/path /output/dataset/path
     
     # With custom worker count:
-    python prepare_csv_wavs.py /input/dataset/path /output/dataset/path --language hindi --workers 4 --preprocess-audio
+    python prepare_hindi_english.py /input/dataset/path /output/dataset/path --workers 4
+    
+    # For your specific path:
+    python prepare_hindi_english.py "/media/rdp/New Volume/F5-TTS/Combined_Hindi_TTS_Raw_Data" "/path/to/output"
             """,
+            formatter_class=argparse.RawDescriptionHelpFormatter
         )
-        parser.add_argument("inp_dir", type=str, help="Input directory containing the data.")
-        parser.add_argument("out_dir", type=str, help="Output directory to save the prepared data.")
-        parser.add_argument("--language", type=str, default="chinese", 
-                           choices=["chinese", "hindi", "hindi1", "english", "other"],
-                           help="Language of the dataset (affects text processing)")
-        parser.add_argument("--pretrain", action="store_true", help="Enable for new pretrain, otherwise is a fine-tune")
+        parser.add_argument("inp_dir", type=str, help="Input directory containing metadata.csv and wavs folder")
+        parser.add_argument("out_dir", type=str, help="Output directory for processed dataset")
         parser.add_argument("--workers", type=int, help=f"Number of worker threads (default: {MAX_WORKERS})")
-        parser.add_argument("--preprocess-audio", action="store_true", 
-                           help="Preprocess audio files to mono 24kHz before processing")
+        
         args = parser.parse_args()
 
-        prepare_and_save_set(args.inp_dir, args.out_dir, 
-                           language=args.language, 
-                           is_finetune=not args.pretrain, 
-                           num_workers=args.workers,
-                           preprocess_audio=args.preprocess_audio)
+        print(f"Input directory: {args.inp_dir}")
+        print(f"Output directory: {args.out_dir}")
+        print(f"Target audio format: {TARGET_SAMPLE_RATE}Hz, {'mono' if TARGET_CHANNELS == 1 else 'stereo'}")
+        
+        prepare_and_save_set(args.inp_dir, args.out_dir, num_workers=args.workers)
+        print("\nProcessing completed successfully!")
+        
     except KeyboardInterrupt:
         print("\nOperation cancelled by user. Cleaning up...")
         if executor is not None:
